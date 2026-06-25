@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   BadgeCheck,
   Bot,
@@ -32,7 +32,24 @@ import {
   UsersRound,
   X,
 } from "lucide-react";
+import {
+  analyzeDivinationReport,
+  directusConfig,
+  getCurrentUser,
+  getStoredSession,
+  listUserItems,
+  loginUser,
+  logoutUser,
+  refreshSession,
+  readItem,
+  registerUser,
+  submitLead,
+  submitSystemEvent,
+  updateItem,
+  uploadFile,
+} from "./directusApi.js";
 import { servicePages } from "./servicePages.js";
+import { useMotionEffects } from "./useMotionEffects.js";
 
 const icons = {
   BadgeCheck,
@@ -158,6 +175,37 @@ const divinationProfileItems = [
   ["深度咨询", "1次待跟进", "顾问会结合历史测算继续解读关键问题。"],
 ];
 
+const collectionLabels = {
+  legal_consultations: "法律咨询",
+  legal_bookings: "法律预约",
+  legal_cases: "法律案例",
+  beauty_reports: "医美报告",
+  beauty_advisor_requests: "顾问需求",
+  beauty_scan_results: "面诊扫描",
+  divination_reports: "国学报告",
+  divination_consults: "深度咨询",
+  divination_shares: "分享记录",
+};
+
+const statusLabels = {
+  new: "新线索",
+  contacted: "已联系",
+  qualified: "已确认",
+  booked: "已预约",
+  in_progress: "跟进中",
+  closed: "已完成",
+  rejected: "已取消",
+  archived: "已归档",
+  started: "已开始",
+};
+
+const statusOptions = [
+  ["contacted", "标记联系"],
+  ["in_progress", "跟进中"],
+  ["closed", "已完成"],
+  ["rejected", "取消"],
+];
+
 const conversionFields = {
   legal: {
     lawyer: {
@@ -267,17 +315,31 @@ function Directory({ pages }) {
 }
 
 function ServicePage({ page, standalone = false }) {
+  const motionRootRef = useRef(null);
   const [query, setQuery] = useState(page.defaultQuestion ?? "");
   const [notice, setNotice] = useState("");
   const [modal, setModal] = useState(null);
   const [activeTab, setActiveTab] = useState(0);
   const [activeQuick, setActiveQuick] = useState(0);
+  const [activeMetric, setActiveMetric] = useState("");
+  const [activeAdvisorItem, setActiveAdvisorItem] = useState("");
   const [activeStep, setActiveStep] = useState(1);
   const [scanning, setScanning] = useState(false);
   const [scanProgress, setScanProgress] = useState(65);
   const [spinning, setSpinning] = useState(false);
   const [spinAngle, setSpinAngle] = useState(0);
   const [fortuneIndex, setFortuneIndex] = useState(0);
+  const [session, setSession] = useState(() => getStoredSession());
+  const [currentUser, setCurrentUser] = useState(null);
+  const [authError, setAuthError] = useState("");
+  const [authBusy, setAuthBusy] = useState(false);
+  const [records, setRecords] = useState([]);
+  const [recordsBusy, setRecordsBusy] = useState(false);
+  const [recordsError, setRecordsError] = useState("");
+  const [selectedRecord, setSelectedRecord] = useState(null);
+  const [recordActionBusy, setRecordActionBusy] = useState("");
+  const [divinationAiAnalysis, setDivinationAiAnalysis] = useState(null);
+  const [divinationAiBusy, setDivinationAiBusy] = useState(false);
 
   useEffect(() => {
     if (!scanning) return undefined;
@@ -297,9 +359,110 @@ function ServicePage({ page, standalone = false }) {
     return () => window.clearTimeout(timer);
   }, [notice]);
 
+  useEffect(() => {
+    let ignored = false;
+    if (!session?.access_token) {
+      setCurrentUser(null);
+      return undefined;
+    }
+
+    getCurrentUser(session)
+      .catch(async () => {
+        const nextSession = await refreshSession(session);
+        if (!ignored && nextSession) setSession(nextSession);
+        return nextSession ? getCurrentUser(nextSession) : null;
+      })
+      .then((user) => {
+        if (!ignored) setCurrentUser(user);
+      })
+      .catch(() => {
+        if (!ignored) {
+          setSession(null);
+          setCurrentUser(null);
+        }
+      });
+
+    return () => {
+      ignored = true;
+    };
+  }, [session]);
+
+  useEffect(() => {
+    let ignored = false;
+    if (!session?.access_token || !currentUser?.id) {
+      setRecords([]);
+      setSelectedRecord(null);
+      setRecordsError("");
+      setRecordsBusy(false);
+      return undefined;
+    }
+
+    setRecordsBusy(true);
+    setRecordsError("");
+    listUserItems({ pageId: page.id, session, userId: currentUser.id })
+      .then((items) => {
+        if (!ignored) setRecords(items);
+      })
+      .catch((error) => {
+        if (!ignored) setRecordsError(error.message);
+      })
+      .finally(() => {
+        if (!ignored) setRecordsBusy(false);
+      });
+
+    return () => {
+      ignored = true;
+    };
+  }, [page.id, session, currentUser?.id]);
+
   const fortuneList =
     page.id === "divination" ? [...(page.fortunes ?? []), ...extraDivinationFortunes] : (page.fortunes ?? []);
   const activeFortune = fortuneList[fortuneIndex % fortuneList.length];
+
+  useMotionEffects({
+    activeTab,
+    analysisKey: divinationAiAnalysis?.id || divinationAiAnalysis?.generated_at || divinationAiAnalysis?.summary || "",
+    pageId: page.id,
+    rootRef: motionRootRef,
+    scanning,
+    spinning,
+  });
+
+  async function loadUserRecords({ silent = false } = {}) {
+    if (!session?.access_token || !currentUser?.id) return [];
+    if (!silent) setRecordsBusy(true);
+    setRecordsError("");
+    try {
+      const items = await listUserItems({ pageId: page.id, session, userId: currentUser.id });
+      setRecords(items);
+      return items;
+    } catch (error) {
+      setRecordsError(error.message);
+      throw error;
+    } finally {
+      if (!silent) setRecordsBusy(false);
+    }
+  }
+
+  async function requestDivinationAnalysis(fortune, actionId = "spin") {
+    setDivinationAiBusy(true);
+    setNotice("AI 正在生成国学解读...");
+    try {
+      const analysis = await analyzeDivinationReport({
+        question: query,
+        fortune,
+        actionId,
+        session,
+        context: { activeTab, pageId: page.id },
+      });
+      setDivinationAiAnalysis(analysis);
+      setNotice(analysis.provider_status === "live" ? "AI 国学解读已生成。" : "已生成本地国学解读。");
+    } catch (error) {
+      setNotice(error.message);
+    } finally {
+      setDivinationAiBusy(false);
+    }
+  }
 
   function runAction(actionId) {
     const action = page.actions.find((item) => item.id === actionId);
@@ -309,6 +472,15 @@ function ServicePage({ page, standalone = false }) {
       setScanProgress(65);
       setScanning(true);
       setNotice(action.detail);
+      if (session?.access_token) {
+        submitSystemEvent({
+          pageId: page.id,
+          actionId,
+          values: { progress: 65, status: "started" },
+          session,
+          context: { activeTab },
+        }).catch(() => null);
+      }
       return;
     }
 
@@ -317,14 +489,27 @@ function ServicePage({ page, standalone = false }) {
       setSpinning(true);
       setNotice(action.detail);
       setSpinAngle((angle) => angle + 720 + (1 + Math.floor(Math.random() * 12)) * 30);
+      if (session?.access_token) {
+        submitSystemEvent({
+          pageId: page.id,
+          actionId,
+          values: { status: "started" },
+          session,
+          context: { activeTab },
+        }).catch(() => null);
+      }
       window.setTimeout(() => {
+        let selectedFortune = activeFortune;
         setFortuneIndex((value) => {
           if (fortuneList.length <= 1) return value;
           const current = value % fortuneList.length;
           const offset = 1 + Math.floor(Math.random() * (fortuneList.length - 1));
-          return (current + offset) % fortuneList.length;
+          const nextIndex = (current + offset) % fortuneList.length;
+          selectedFortune = fortuneList[nextIndex];
+          return nextIndex;
         });
         setSpinning(false);
+        requestDivinationAnalysis(selectedFortune, actionId);
       }, 920);
       return;
     }
@@ -335,11 +520,21 @@ function ServicePage({ page, standalone = false }) {
     }
 
     const conversion = conversionFields[page.id]?.[actionId];
+    const authRequired = Boolean(conversion);
+
+    if (authRequired && !session?.access_token) {
+      setActiveTab(2);
+      setNotice("请先登录或注册，再提交服务需求。");
+      return;
+    }
 
     setModal({
       title: action.label,
       body: action.detail,
       button: actionId === "booking" ? "确认预约" : "确认提交",
+      pageId: page.id,
+      actionId,
+      authRequired,
       fields: conversion?.fields ?? [],
       consent: conversion?.consent ?? "",
       success: conversion?.success ?? `${action.label}已提交。`,
@@ -347,15 +542,243 @@ function ServicePage({ page, standalone = false }) {
   }
 
   function handleQuickAction(item, index) {
+    if (page.id === "divination") {
+      setActiveQuick(index);
+      if (index === 3) {
+        runAction("consult");
+        return;
+      }
+
+      const topicNotes = [
+        ["事业运势", "结合当前转盘结果，重点关注机会窗口、合作推进和资源承接节奏。"],
+        ["感情运势", "结合当前转盘结果，重点关注沟通方式、关系边界和情绪稳定度。"],
+        ["财富建议", "结合当前转盘结果，重点关注预算边界、投入节奏和风险预留空间。"],
+      ];
+      const [title, note] = topicNotes[index] ?? [item.label, "已根据当前结果整理出对应解读。"];
+
+      setModal({
+        type: "card-detail",
+        title,
+        body: "以下是根据当前转盘结果整理出的专项解读，可继续领取报告或进入深度咨询。",
+        sections: [
+          {
+            title: "当前判断",
+            items: [
+              note,
+              activeFortune?.items?.[index % activeFortune.items.length]?.[1] || "建议先完成一次测算，再查看更完整的专项分析。",
+            ],
+          },
+          {
+            title: "下一步",
+            items: ["点击领取报告可保存本次结果。", "需要更具体的个人问题时，可进入私域顾问继续解读。"],
+          },
+        ],
+        nextActions: [
+          { id: "share", label: "领取报告", caption: "生成并保存结果" },
+          { id: "consult", label: "私域顾问", caption: "进入专业解读" },
+        ],
+      });
+      return;
+    }
     setActiveQuick(index);
     if (page.id === "legal" && item.seed) setQuery(item.seed);
     setNotice(`${item.label}已选中，页面已切换到对应服务入口。`);
   }
 
   function handleStep(index) {
+    if (page.id === "divination") {
+      setActiveStep(index);
+      const actionByStep = [null, "spin", "share", "consult", "consult", "consult"];
+      const actionId = actionByStep[index];
+      if (actionId) {
+        runAction(actionId);
+        return;
+      }
+
+      setModal({
+        type: "card-detail",
+        title: page.flowSteps[index].title,
+        body: "这是用户进入测算前的兴趣入口，可先完成一次转盘测算，再领取报告或进入顾问解读。",
+        sections: [
+          {
+            title: "入口说明",
+            items: ["内容种草用于承接兴趣，不直接提交表单。", "继续点击测算可以生成新的转盘结果。"],
+          },
+        ],
+        nextActions: [{ id: "spin", label: "点击测算", caption: "进入体验" }],
+      });
+      return;
+    }
     setActiveStep(index);
     setNotice(`${page.flowSteps[index].title}：${page.flowSteps[index].caption}`);
   }
+
+  function handleMetric(item) {
+    setActiveMetric(item.label);
+    setNotice(`${item.label} 当前评分 ${item.value}/100，点击领取报告可查看完整分析。`);
+  }
+
+  function handleAdvisorItem(title, value, note) {
+    setActiveAdvisorItem(title);
+    setNotice(`${title}：${value}，${note}`);
+  }
+
+  function openTabCardDetail({
+    actionId,
+    actionLabel,
+    eyebrow,
+    note,
+    result,
+    secondaryActionId,
+    secondaryLabel,
+    title,
+    value,
+  }) {
+    setModal({
+      type: "card-detail",
+      title,
+      body: note,
+      button: "知道了",
+      sections: [
+        { title: eyebrow || "当前状态", items: [value || "已记录"] },
+        { title: "详情说明", items: [note] },
+        ...(result ? [{ title: "处理结果", items: [result] }] : []),
+      ],
+      nextActions: [
+        actionId && { id: actionId, label: actionLabel || "继续处理", caption: "提交需求并进入后续服务" },
+        secondaryActionId && { id: secondaryActionId, label: secondaryLabel || "查看下一步", caption: "切换到对应服务入口" },
+      ].filter(Boolean),
+    });
+  }
+
+  async function handleRecordOpen(record) {
+    setRecordActionBusy(record.id);
+    setRecordsError("");
+    try {
+      const detail = await readItem({ collection: record.collection, id: record.id, session });
+      setSelectedRecord(detail);
+      setRecords((current) => current.map((item) => (item.id === detail.id ? detail : item)));
+    } catch (error) {
+      setRecordsError(error.message);
+    } finally {
+      setRecordActionBusy("");
+    }
+  }
+
+  async function handleRecordStatus(status) {
+    if (!selectedRecord) return;
+    setRecordActionBusy("status");
+    setRecordsError("");
+    try {
+      const updated = await updateItem({
+        collection: selectedRecord.collection,
+        id: selectedRecord.id,
+        values: { status },
+        session,
+      });
+      setSelectedRecord(updated);
+      setRecords((current) => current.map((item) => (item.id === updated.id ? updated : item)));
+      setNotice(`状态已更新为${statusLabels[status] || status}。`);
+    } catch (error) {
+      setRecordsError(error.message);
+    } finally {
+      setRecordActionBusy("");
+    }
+  }
+
+  async function handleRecordUpload(file) {
+    setRecordActionBusy("upload");
+    setRecordsError("");
+    try {
+      const uploaded = await uploadFile({
+        file,
+        session,
+        metadata: {
+          source_page: page.id,
+          record_id: selectedRecord?.id,
+          collection: selectedRecord?.collection,
+        },
+      });
+      setNotice(`${uploaded?.filename_download || file.name} 已上传到资料记录。`);
+    } catch (error) {
+      setRecordsError(error.message);
+    } finally {
+      setRecordActionBusy("");
+    }
+  }
+
+  async function handleAuthSubmit(mode, values) {
+    setAuthBusy(true);
+    setAuthError("");
+    try {
+      if (mode === "register") {
+        await registerUser(values);
+        setNotice("注册已提交，请按邮件验证要求完成后登录。");
+        return;
+      }
+      const nextSession = await loginUser(values);
+      setSession(nextSession);
+      setNotice("登录成功，后续表单会保存为你的服务记录。");
+    } catch (error) {
+      setAuthError(error.message);
+    } finally {
+      setAuthBusy(false);
+    }
+  }
+
+  async function handleLogout() {
+    setAuthBusy(true);
+    await logoutUser(session);
+    setSession(null);
+    setCurrentUser(null);
+    setAuthBusy(false);
+    setNotice("已退出登录。");
+  }
+
+  async function handleLeadSubmit(modal, values) {
+    if (modal.authRequired) {
+      await submitLead({
+        pageId: modal.pageId,
+        actionId: modal.actionId,
+        values,
+        session,
+        context: {
+          query: page.id === "legal" ? query : undefined,
+          activeTab,
+        },
+      });
+    }
+    setModal(null);
+    setNotice(modal.success);
+    loadUserRecords({ silent: true }).catch(() => null);
+  }
+
+  const authPanel = (
+    <AuthPanel
+      busy={authBusy}
+      error={authError}
+      onLogout={handleLogout}
+      onSubmit={handleAuthSubmit}
+      page={page}
+      session={session}
+      user={currentUser}
+    />
+  );
+
+  const recordsPanel = (
+    <DirectusRecordsPanel
+      actionBusy={recordActionBusy}
+      busy={recordsBusy}
+      error={recordsError}
+      onOpenRecord={handleRecordOpen}
+      onRefresh={loadUserRecords}
+      onStatus={handleRecordStatus}
+      onUploadFile={handleRecordUpload}
+      records={records}
+      selectedRecord={selectedRecord}
+      session={session}
+    />
+  );
 
   return (
     <main className={`service-page theme-${page.theme}${standalone ? " service-standalone" : ""}`}>
@@ -364,8 +787,17 @@ function ServicePage({ page, standalone = false }) {
       </a>
       <section className="phone-stage">
         <div className="phone-frame">
-          <div className="phone-screen with-bottom-nav">
-            <StatusBar light={page.id === "beauty"} />
+          <div className="phone-screen with-bottom-nav" ref={motionRootRef}>
+            {activeTab !== 2 && (
+              <button
+                className={`auth-shortcut${session?.access_token ? " is-connected" : ""}`}
+                onClick={() => setActiveTab(2)}
+                type="button"
+              >
+                <User size={16} />
+                <span>{session?.access_token ? "账号已登录" : "登录 / 注册"}</span>
+              </button>
+            )}
             {page.id === "legal" && activeTab === 0 && (
               <LegalTool
                 page={page}
@@ -378,20 +810,40 @@ function ServicePage({ page, standalone = false }) {
                 runAction={runAction}
               />
             )}
-            {page.id === "legal" && activeTab === 1 && <LegalCasesPage runAction={runAction} />}
-            {page.id === "legal" && activeTab === 2 && <LegalProfilePage runAction={runAction} />}
+            {page.id === "legal" && activeTab === 1 && <LegalCasesPage onOpenCard={openTabCardDetail} runAction={runAction} />}
+            {page.id === "legal" && activeTab === 2 && (
+              <LegalProfilePage authPanel={authPanel} onOpenCard={openTabCardDetail} recordsPanel={recordsPanel} runAction={runAction} />
+            )}
             {page.id === "beauty" && activeTab === 0 && (
               <BeautyTool
                 page={page}
                 activeQuick={activeQuick}
+                activeMetric={activeMetric}
                 handleQuickAction={handleQuickAction}
+                handleMetric={handleMetric}
                 progress={scanProgress}
                 scanning={scanning}
                 runAction={runAction}
               />
             )}
-            {page.id === "beauty" && activeTab === 1 && <BeautyReportPage page={page} runAction={runAction} />}
-            {page.id === "beauty" && activeTab === 2 && <BeautyAdvisorPage runAction={runAction} />}
+            {page.id === "beauty" && activeTab === 1 && (
+              <BeautyReportPage
+                activeMetric={activeMetric}
+                handleMetric={handleMetric}
+                onOpenCard={openTabCardDetail}
+                page={page}
+                runAction={runAction}
+              />
+            )}
+            {page.id === "beauty" && activeTab === 2 && (
+              <BeautyAdvisorPage
+                activeAdvisorItem={activeAdvisorItem}
+                authPanel={authPanel}
+                handleAdvisorItem={handleAdvisorItem}
+                onOpenCard={openTabCardDetail}
+                runAction={runAction}
+              />
+            )}
             {page.id === "divination" && activeTab === 0 && (
               <DivinationTool
                 page={page}
@@ -400,13 +852,19 @@ function ServicePage({ page, standalone = false }) {
                 activeStep={activeStep}
                 handleQuickAction={handleQuickAction}
                 handleStep={handleStep}
+                aiAnalysis={divinationAiAnalysis}
+                aiBusy={divinationAiBusy}
                 spinning={spinning}
                 spinAngle={spinAngle}
                 runAction={runAction}
               />
             )}
-            {page.id === "divination" && activeTab === 1 && <DivinationHistoryPage runAction={runAction} />}
-            {page.id === "divination" && activeTab === 2 && <DivinationProfilePage runAction={runAction} />}
+            {page.id === "divination" && activeTab === 1 && (
+              <DivinationHistoryPage onOpenCard={openTabCardDetail} recordsPanel={recordsPanel} runAction={runAction} />
+            )}
+            {page.id === "divination" && activeTab === 2 && (
+              <DivinationProfilePage authPanel={authPanel} onOpenCard={openTabCardDetail} recordsPanel={recordsPanel} runAction={runAction} />
+            )}
             <BottomNav tabs={page.tabs} activeTab={activeTab} setActiveTab={setActiveTab} />
           </div>
         </div>
@@ -417,23 +875,14 @@ function ServicePage({ page, standalone = false }) {
         <Modal
           modal={modal}
           onClose={() => setModal(null)}
-          onSubmit={(message) => {
+          onAction={(actionId) => {
             setModal(null);
-            setNotice(message);
+            runAction(actionId);
           }}
+          onSubmit={(values) => handleLeadSubmit(modal, values)}
         />
       )}
     </main>
-  );
-}
-
-function StatusBar({ light = false }) {
-  return (
-    <div className={`status-bar ${light ? "light" : ""}`}>
-      <span>10:09</span>
-      <span>5G</span>
-      <span>88%</span>
-    </div>
   );
 }
 
@@ -496,7 +945,7 @@ function LegalTool({
   );
 }
 
-function BeautyTool({ page, activeQuick, handleQuickAction, progress, scanning, runAction }) {
+function BeautyTool({ page, activeQuick, activeMetric, handleQuickAction, handleMetric, progress, scanning, runAction }) {
   return (
     <section className="app-screen beauty-screen">
       <AppHeader title={page.toolName} light />
@@ -537,7 +986,13 @@ function BeautyTool({ page, activeQuick, handleQuickAction, progress, scanning, 
         <h2>面部问题分析报告</h2>
         <div className="metric-grid">
           {page.metrics.map((item) => (
-            <button className={`metric metric-${item.tone}`} key={item.label} type="button">
+            <button
+              aria-pressed={activeMetric === item.label}
+              className={`metric metric-${item.tone}${activeMetric === item.label ? " is-active" : ""}`}
+              key={item.label}
+              onClick={() => handleMetric(item)}
+              type="button"
+            >
               <span>{item.label}</span>
               <strong>{item.value}/100</strong>
               <small>★★★★★</small>
@@ -583,7 +1038,7 @@ function BeautyTool({ page, activeQuick, handleQuickAction, progress, scanning, 
   );
 }
 
-function BeautyReportPage({ page, runAction }) {
+function BeautyReportPage({ activeMetric, handleMetric, onOpenCard, page, runAction }) {
   return (
     <section className="app-screen beauty-screen tab-page beauty-tab-page">
       <AppHeader title="面诊报告" subtitle="肤质评估 · 护理建议" light />
@@ -600,7 +1055,13 @@ function BeautyReportPage({ page, runAction }) {
         <h2>核心指标</h2>
         <div className="metric-grid">
           {page.metrics.map((item) => (
-            <button className={`metric metric-${item.tone}`} key={item.label} type="button">
+            <button
+              aria-pressed={activeMetric === item.label}
+              className={`metric metric-${item.tone}${activeMetric === item.label ? " is-active" : ""}`}
+              key={item.label}
+              onClick={() => handleMetric(item)}
+              type="button"
+            >
               <span>{item.label}</span>
               <strong>{item.value}/100</strong>
               <small>AI 评估</small>
@@ -611,13 +1072,29 @@ function BeautyReportPage({ page, runAction }) {
 
       <div className="tab-list">
         {beautyReportItems.map(([title, value, note]) => (
-          <article className="tab-card beauty-tab-card compact-card" key={title}>
+          <button
+            className="tab-card tab-card-button beauty-tab-card compact-card"
+            key={title}
+            onClick={() =>
+              onOpenCard({
+                title,
+                value,
+                note,
+                eyebrow: "面诊报告",
+                actionId: "report",
+                actionLabel: "领取完整报告",
+                secondaryActionId: "advisor",
+                secondaryLabel: "获取方案",
+              })
+            }
+            type="button"
+          >
             <div className="tab-card-head">
               <span>{title}</span>
               <b>{value}</b>
             </div>
             <p>{note}</p>
-          </article>
+          </button>
         ))}
       </div>
 
@@ -633,10 +1110,11 @@ function BeautyReportPage({ page, runAction }) {
   );
 }
 
-function BeautyAdvisorPage({ runAction }) {
+function BeautyAdvisorPage({ activeAdvisorItem, authPanel, handleAdvisorItem, onOpenCard, runAction }) {
   return (
     <section className="app-screen beauty-screen tab-page beauty-tab-page">
       <AppHeader title="专属顾问" subtitle="方案 · 预约 · 跟进" light />
+      {authPanel}
 
       <article className="tab-hero beauty-tab-hero advisor-hero">
         <Headphones size={22} />
@@ -648,13 +1126,31 @@ function BeautyAdvisorPage({ runAction }) {
 
       <div className="tab-list">
         {beautyAdvisorItems.map(([title, value, note]) => (
-          <article className="tab-card beauty-tab-card compact-card" key={title}>
+          <button
+            aria-pressed={activeAdvisorItem === title}
+            className={`tab-card tab-card-button beauty-tab-card compact-card${activeAdvisorItem === title ? " is-active" : ""}`}
+            key={title}
+            onClick={() => {
+              handleAdvisorItem(title, value, note);
+              onOpenCard({
+                title,
+                value,
+                note,
+                eyebrow: "顾问服务",
+                actionId: "advisor",
+                actionLabel: "提交顾问需求",
+                secondaryActionId: "report",
+                secondaryLabel: "查看报告",
+              });
+            }}
+            type="button"
+          >
             <div className="tab-card-head">
               <span>{title}</span>
               <b>{value}</b>
             </div>
             <p>{note}</p>
-          </article>
+          </button>
         ))}
       </div>
 
@@ -686,6 +1182,8 @@ function DivinationTool({
   activeStep,
   handleQuickAction,
   handleStep,
+  aiAnalysis,
+  aiBusy,
   spinning,
   spinAngle,
   runAction,
@@ -738,6 +1236,7 @@ function DivinationTool({
       </div>
 
       <FlowStrip steps={page.flowSteps} activeStep={activeStep} handleStep={handleStep} compact />
+      <DivinationAiAnalysisPanel analysis={aiAnalysis} busy={aiBusy} />
 
       <button className="link-button warm-link" onClick={() => runAction("consult")} type="button">
         深度咨询
@@ -754,7 +1253,42 @@ function DivinationTool({
   );
 }
 
-function LegalCasesPage({ runAction }) {
+function DivinationAiAnalysisPanel({ analysis, busy }) {
+  if (busy) {
+    return (
+      <article className="ai-analysis divination-ai-analysis">
+        <strong>AI 正在解读</strong>
+        <p>正在结合签文、关注方向和当前节奏生成解读。</p>
+      </article>
+    );
+  }
+  if (!analysis) return null;
+
+  return (
+    <article className="ai-analysis divination-ai-analysis">
+      <div className="ai-analysis-head">
+        <strong>AI 国学解读</strong>
+      </div>
+      <p>{analysis.summary}</p>
+      <div className="ai-analysis-grid">
+        {(analysis.recommendations || []).slice(0, 4).map((item) => (
+          <span key={item}>{item}</span>
+        ))}
+      </div>
+      {analysis.timing_notes?.length > 0 && (
+        <div className="ai-analysis-list">
+          <b>节奏提示</b>
+          {analysis.timing_notes.slice(0, 3).map((item) => (
+            <small key={item}>{item}</small>
+          ))}
+        </div>
+      )}
+      <small>{analysis.disclaimer}</small>
+    </article>
+  );
+}
+
+function LegalCasesPage({ onOpenCard, runAction }) {
   return (
     <section className="app-screen legal-screen tab-page">
       <AppHeader title="案例中心" subtitle="类案参考 · 处理路径" dark />
@@ -768,7 +1302,24 @@ function LegalCasesPage({ runAction }) {
 
       <div className="tab-list">
         {legalCases.map((item) => (
-          <article className="tab-card" key={item.title}>
+          <button
+            className="tab-card tab-card-button"
+            key={item.title}
+            onClick={() =>
+              onOpenCard({
+                title: item.title,
+                value: item.status,
+                note: item.detail,
+                eyebrow: item.type,
+                result: item.result,
+                actionId: "lawyer",
+                actionLabel: "咨询同类问题",
+                secondaryActionId: "booking",
+                secondaryLabel: "预约面谈",
+              })
+            }
+            type="button"
+          >
             <div className="tab-card-head">
               <span>{item.type}</span>
               <b>{item.status}</b>
@@ -776,7 +1327,7 @@ function LegalCasesPage({ runAction }) {
             <h3>{item.title}</h3>
             <p>{item.detail}</p>
             <small>{item.result}</small>
-          </article>
+          </button>
         ))}
       </div>
 
@@ -792,10 +1343,11 @@ function LegalCasesPage({ runAction }) {
   );
 }
 
-function LegalProfilePage({ runAction }) {
+function LegalProfilePage({ authPanel, onOpenCard, recordsPanel, runAction }) {
   return (
     <section className="app-screen legal-screen tab-page">
       <AppHeader title="我的法律服务" subtitle="咨询 · 材料 · 预约" dark />
+      {authPanel}
       <article className="tab-hero profile-hero">
         <User size={22} />
         <div>
@@ -806,15 +1358,33 @@ function LegalProfilePage({ runAction }) {
 
       <div className="tab-list">
         {legalProfileItems.map(([title, value, note]) => (
-          <article className="tab-card compact-card" key={title}>
+          <button
+            className="tab-card tab-card-button compact-card"
+            key={title}
+            onClick={() =>
+              onOpenCard({
+                title,
+                value,
+                note,
+                eyebrow: "我的服务",
+                actionId: "lawyer",
+                actionLabel: "继续咨询",
+                secondaryActionId: "booking",
+                secondaryLabel: "查看预约",
+              })
+            }
+            type="button"
+          >
             <div className="tab-card-head">
               <span>{title}</span>
               <b>{value}</b>
             </div>
             <p>{note}</p>
-          </article>
+          </button>
         ))}
       </div>
+
+      {recordsPanel}
 
       <div className="tab-checklist">
         {["确认诉求金额", "补齐证据材料", "等待律师回访"].map((item) => (
@@ -837,7 +1407,7 @@ function LegalProfilePage({ runAction }) {
   );
 }
 
-function DivinationHistoryPage({ runAction }) {
+function DivinationHistoryPage({ onOpenCard, recordsPanel, runAction }) {
   return (
     <section className="app-screen divination-screen tab-page">
       <header className="mystic-header">
@@ -853,7 +1423,24 @@ function DivinationHistoryPage({ runAction }) {
 
       <div className="tab-list">
         {divinationHistory.map((item) => (
-          <article className="tab-card history-card" key={item.date}>
+          <button
+            className="tab-card tab-card-button history-card"
+            key={item.date}
+            onClick={() =>
+              onOpenCard({
+                title: item.title,
+                value: item.score,
+                note: item.note,
+                eyebrow: item.date,
+                result: `关注方向：${item.focus}`,
+                actionId: "consult",
+                actionLabel: "深度咨询",
+                secondaryActionId: "spin",
+                secondaryLabel: "再测一次",
+              })
+            }
+            type="button"
+          >
             <div className="tab-card-head">
               <span>{item.date}</span>
               <b>{item.score}</b>
@@ -861,9 +1448,11 @@ function DivinationHistoryPage({ runAction }) {
             <h3>{item.title}</h3>
             <p>{item.note}</p>
             <small>关注方向：{item.focus}</small>
-          </article>
+          </button>
         ))}
       </div>
+
+      {recordsPanel}
 
       <div className="tab-actions">
         <button className="secondary" onClick={() => runAction("spin")} type="button">
@@ -877,9 +1466,10 @@ function DivinationHistoryPage({ runAction }) {
   );
 }
 
-function DivinationProfilePage({ runAction }) {
+function DivinationProfilePage({ authPanel, onOpenCard, recordsPanel, runAction }) {
   return (
     <section className="app-screen divination-screen tab-page">
+      {authPanel}
       <header className="mystic-header">
         <div className="avatar-moon">
           <User size={24} />
@@ -901,15 +1491,33 @@ function DivinationProfilePage({ runAction }) {
 
       <div className="tab-list">
         {divinationProfileItems.map(([title, value, note]) => (
-          <article className="tab-card compact-card" key={title}>
+          <button
+            className="tab-card tab-card-button compact-card"
+            key={title}
+            onClick={() =>
+              onOpenCard({
+                title,
+                value,
+                note,
+                eyebrow: "我的档案",
+                actionId: "consult",
+                actionLabel: "联系顾问",
+                secondaryActionId: "share",
+                secondaryLabel: "分享结果",
+              })
+            }
+            type="button"
+          >
             <div className="tab-card-head">
               <span>{title}</span>
               <b>{value}</b>
             </div>
             <p>{note}</p>
-          </article>
+          </button>
         ))}
       </div>
+
+      {recordsPanel}
 
       <div className="tab-actions">
         <button className="secondary" onClick={() => runAction("share")} type="button">
@@ -1310,6 +1918,113 @@ function FlowStrip({ steps, activeStep, handleStep, compact = false }) {
   );
 }
 
+function recordTitle(record) {
+  return (
+    record.name ||
+    record.first_name ||
+    record.goal ||
+    record.topic ||
+    record.channel ||
+    record.action_id ||
+    collectionLabels[record.collection] ||
+    "服务记录"
+  );
+}
+
+function recordNote(record) {
+  return record.summary || record.note || record.budget || record.time || record.status || "已保存为你的服务记录。";
+}
+
+function recordDate(record) {
+  const value = record.date_updated || record.date_created || record.submitted_at;
+  if (!value) return "刚刚";
+  return new Date(value).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+}
+
+function DirectusRecordsPanel({
+  actionBusy,
+  busy,
+  error,
+  onOpenRecord,
+  onRefresh,
+  onStatus,
+  onUploadFile,
+  records,
+  selectedRecord,
+  session,
+}) {
+  const isLoggedIn = Boolean(session?.access_token);
+
+  return (
+    <section className="directus-records">
+      <div className="records-head">
+        <div>
+          <span>我的记录</span>
+          <strong>服务进度</strong>
+        </div>
+        <button disabled={!isLoggedIn || busy} onClick={() => onRefresh()} type="button">
+          {busy ? "读取中" : "刷新"}
+        </button>
+      </div>
+
+      {!isLoggedIn && <p className="record-empty">登录后可查看你提交的服务记录。</p>}
+      {isLoggedIn && error && <strong className="modal-error">{error}</strong>}
+      {isLoggedIn && busy && <p className="record-empty">正在读取你的服务记录...</p>}
+      {isLoggedIn && !busy && records.length === 0 && <p className="record-empty">暂无服务记录，提交表单后会显示在这里。</p>}
+
+      {isLoggedIn && records.length > 0 && (
+        <div className="record-list">
+          {records.map((record) => (
+            <button
+              className={`record-row${selectedRecord?.id === record.id ? " is-active" : ""}`}
+              disabled={actionBusy === record.id}
+              key={`${record.collection}-${record.id}`}
+              onClick={() => onOpenRecord(record)}
+              type="button"
+            >
+              <span>{collectionLabels[record.collection] || record.collection}</span>
+              <strong>{recordTitle(record)}</strong>
+              <small>{recordNote(record)}</small>
+              <b>{statusLabels[record.status] || record.status || "新线索"} · {recordDate(record)}</b>
+            </button>
+          ))}
+        </div>
+      )}
+
+      {isLoggedIn && selectedRecord && (
+        <article className="record-detail">
+          <div className="record-detail-head">
+            <span>{collectionLabels[selectedRecord.collection] || selectedRecord.collection}</span>
+            <b>{statusLabels[selectedRecord.status] || selectedRecord.status || "新线索"}</b>
+          </div>
+          <h3>{recordTitle(selectedRecord)}</h3>
+          <p>{recordNote(selectedRecord)}</p>
+          <small>记录 ID：{selectedRecord.id}</small>
+          <div className="record-actions">
+            {statusOptions.map(([status, label]) => (
+              <button disabled={actionBusy === "status"} key={status} onClick={() => onStatus(status)} type="button">
+                {label}
+              </button>
+            ))}
+          </div>
+          <label className="upload-row">
+            <span>上传材料/图片</span>
+            <input
+              disabled={actionBusy === "upload"}
+              onChange={(event) => {
+                const file = event.target.files?.[0];
+                if (file) onUploadFile(file);
+                event.target.value = "";
+              }}
+              type="file"
+            />
+          </label>
+        </article>
+      )}
+    </section>
+  );
+}
+
 function BottomNav({ tabs, activeTab, setActiveTab }) {
   const navIcons = [Home, FileText, User];
 
@@ -1333,11 +2048,75 @@ function BottomNav({ tabs, activeTab, setActiveTab }) {
   );
 }
 
-function Modal({ modal, onClose, onSubmit }) {
+function AuthPanel({ busy, error, onLogout, onSubmit, page, session, user }) {
+  const [mode, setMode] = useState("login");
+  const [values, setValues] = useState({ email: "", password: "", firstName: "" });
+  const isLoggedIn = Boolean(session?.access_token);
+
+  function updateField(name, value) {
+    setValues((current) => ({ ...current, [name]: value }));
+  }
+
+  function submitAuth(event) {
+    event.preventDefault();
+    onSubmit(mode, values);
+  }
+
+  if (isLoggedIn) {
+    return (
+      <article className="auth-panel">
+        <div>
+          <span>账号已登录</span>
+          <strong>{user?.first_name || user?.email || "当前用户"}</strong>
+          <p>{directusConfig.url || "未配置 VITE_DIRECTUS_URL"}</p>
+        </div>
+        <button disabled={busy} onClick={onLogout} type="button">
+          退出登录
+        </button>
+      </article>
+    );
+  }
+
+  return (
+    <form className="auth-panel auth-form" onSubmit={submitAuth}>
+      <div className="auth-panel-head">
+        <div>
+          <span>{page.title}</span>
+          <strong>{mode === "login" ? "登录后提交服务需求" : "注册账号"}</strong>
+        </div>
+        <button type="button" onClick={() => setMode(mode === "login" ? "register" : "login")}>
+          {mode === "login" ? "注册" : "登录"}
+        </button>
+      </div>
+      {mode === "register" && (
+        <label className="field-row">
+          <span>称呼</span>
+          <input value={values.firstName} onChange={(event) => updateField("firstName", event.target.value)} />
+        </label>
+      )}
+      <label className="field-row">
+        <span>邮箱</span>
+        <input required type="email" value={values.email} onChange={(event) => updateField("email", event.target.value)} />
+      </label>
+      <label className="field-row">
+        <span>密码</span>
+        <input required minLength={8} type="password" value={values.password} onChange={(event) => updateField("password", event.target.value)} />
+      </label>
+      {!directusConfig.isConfigured && <strong className="modal-error">请先在 .env 中配置 VITE_DIRECTUS_URL。</strong>}
+      {error && <strong className="modal-error">{error}</strong>}
+      <button disabled={busy || !directusConfig.isConfigured} type="submit">
+        {busy ? "处理中..." : mode === "login" ? "登录" : "注册"}
+      </button>
+    </form>
+  );
+}
+
+function Modal({ modal, onAction, onClose, onSubmit }) {
   const initialValues = Object.fromEntries((modal.fields ?? []).map((field) => [field.name, ""]));
   const [values, setValues] = useState(initialValues);
   const [accepted, setAccepted] = useState(false);
   const [error, setError] = useState("");
+  const [submitting, setSubmitting] = useState(false);
   const hasFields = modal.fields?.length > 0;
 
   function updateField(name, value) {
@@ -1345,7 +2124,7 @@ function Modal({ modal, onClose, onSubmit }) {
     if (error) setError("");
   }
 
-  function submitForm(event) {
+  async function submitForm(event) {
     event.preventDefault();
     if (hasFields && modal.fields.some((field) => field.required && !values[field.name]?.trim())) {
       setError("请先补全必填信息。");
@@ -1355,7 +2134,55 @@ function Modal({ modal, onClose, onSubmit }) {
       setError("请先确认授权说明。");
       return;
     }
-    onSubmit(modal.success);
+    setSubmitting(true);
+    try {
+      await onSubmit(values);
+    } catch (submitError) {
+      setError(submitError.message);
+      setSubmitting(false);
+    }
+  }
+
+  if (modal.type === "card-detail") {
+    return (
+      <div className="modal-layer" role="dialog" aria-modal="true" aria-label={modal.title}>
+        <section className="modal-card">
+          <button className="modal-close" onClick={onClose} type="button" aria-label="关闭">
+            <X size={18} />
+          </button>
+          <FileText size={34} />
+          <h2>{modal.title}</h2>
+          <p>{modal.body}</p>
+          {modal.sections?.length > 0 && (
+            <div className="legal-detail-sections">
+              {modal.sections.map((section) => (
+                <section className="legal-detail-section" key={section.title}>
+                  <strong>{section.title}</strong>
+                  <ul>
+                    {section.items.map((item) => (
+                      <li key={item}>{item}</li>
+                    ))}
+                  </ul>
+                </section>
+              ))}
+            </div>
+          )}
+          {modal.nextActions?.length > 0 && (
+            <div className="modal-next-actions">
+              {modal.nextActions.map((action) => (
+                <button key={action.id} onClick={() => onAction?.(action.id)} type="button">
+                  <span>{action.label}</span>
+                  <small>{action.caption}</small>
+                </button>
+              ))}
+            </div>
+          )}
+          <button className="modal-finish" onClick={onClose} type="button">
+            关闭
+          </button>
+        </section>
+      </div>
+    );
   }
 
   return (
@@ -1412,8 +2239,8 @@ function Modal({ modal, onClose, onSubmit }) {
           </label>
         )}
         {error && <strong className="modal-error">{error}</strong>}
-        <button type="submit">
-          {modal.button}
+        <button disabled={submitting} type="submit">
+          {submitting ? "提交中..." : modal.button}
         </button>
       </form>
     </div>
